@@ -13,7 +13,7 @@ A prototype, self-hosted security telemetry pipeline. The repository template in
 - **CLI console:** lists agents and can queue commands for an enrolled agent.
 - **OpenSearch Dashboards:** provides the data exploration UI.
 
-> **Important:** when explicitly enabled, the agent can execute received commands through a shell. This is powerful remote-administration functionality. Run only on systems you own or are authorized to administer; isolate the lab, protect the admin key, and audit use. Command execution is enabled by default; set `REMOTE_COMMANDS_ENABLED=false` on the API and agent to disable it.
+> **Important:** the agent can execute received commands through a shell. This is powerful remote-administration functionality. Run only on systems you own or are authorized to administer; isolate the lab, protect the admin key, and audit use. Command execution is enabled by default; set `REMOTE_COMMANDS_ENABLED=false` on the API and agent to disable it.
 
 ## Configure and run locally
 
