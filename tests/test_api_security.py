@@ -12,6 +12,7 @@ for name, char in {
     "ADMIN_API_KEY": "a",
 }.items():
     os.environ[name] = char * 64
+os.environ.pop("REMOTE_COMMANDS_ENABLED", None)
 
 from fastapi.testclient import TestClient
 from api import main as api
@@ -98,15 +99,17 @@ class ApiSecurityTests(unittest.TestCase):
             ))
         self.assertEqual(response.status_code, 403)
 
-    def test_command_is_disabled_by_default(self):
-        with patch.object(api.r, "lpush") as enqueue:
-            response = self.request(lambda client: client.post(
-                "/send-command",
-                headers={"x-api-key": "a" * 64},
-                json={"agent_id": "agent-1", "command": "echo test"},
-            ))
-        self.assertEqual(response.status_code, 503)
-        enqueue.assert_not_called()
+    def test_command_is_enabled_by_default(self):
+        self.assertTrue(api.REMOTE_COMMANDS_ENABLED)
+        with patch.object(api, "agent_is_enrolled", return_value=True):
+            with patch.object(api.r, "lpush") as enqueue:
+                response = self.request(lambda client: client.post(
+                    "/send-command",
+                    headers={"x-api-key": "a" * 64},
+                    json={"agent_id": "agent-1", "command": "echo test"},
+                ))
+        self.assertEqual(response.status_code, 200)
+        enqueue.assert_called_once_with("commands:agent-1", "echo test")
 
     def test_command_requires_admin_authentication(self):
         with patch.object(api, "REMOTE_COMMANDS_ENABLED", True):

@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 API_URL = os.environ.get("API_URL", "").strip().rstrip("/")
 REGISTRATION_TOKEN = os.environ.get("REGISTRATION_TOKEN", "")
 TOKEN_FILE = Path(os.environ.get("AGENT_TOKEN_FILE", "agent.token"))
-REMOTE_COMMANDS_ENABLED = os.getenv("REMOTE_COMMANDS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+REMOTE_COMMANDS_ENABLED = os.getenv("REMOTE_COMMANDS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEMETRY_INTERVAL = max(10, int(os.getenv("TELEMETRY_INTERVAL", "60")))
 COMMAND_POLL_INTERVAL = max(3, int(os.getenv("COMMAND_POLL_INTERVAL", "5")))
 REQUEST_TIMEOUT = (5, 15)

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+os.environ.pop("REMOTE_COMMANDS_ENABLED", None)
 from agent import main as agent
 
 
@@ -42,7 +43,13 @@ class AgentSecurityTests(unittest.TestCase):
                 token_file.write(json.dumps({"agent_id": "agent-1"}))
             self.assertIsNone(agent.load_token_file(path))
 
-    def test_remote_execution_is_disabled_by_default(self):
+    def test_remote_execution_is_enabled_by_default_without_running_a_command(self):
+        self.assertTrue(agent.REMOTE_COMMANDS_ENABLED)
+        with patch.object(agent.subprocess, "run", return_value=object()) as run:
+            agent.execute_remote_command("echo test")
+        run.assert_called_once()
+
+    def test_remote_execution_can_be_disabled_explicitly(self):
         with patch.object(agent, "REMOTE_COMMANDS_ENABLED", False):
             with self.assertRaises(RuntimeError):
                 agent.execute_remote_command("echo test")

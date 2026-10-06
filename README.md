@@ -13,7 +13,7 @@ A prototype, self-hosted security telemetry pipeline. The repository template in
 - **CLI console:** lists agents and can queue commands for an enrolled agent.
 - **OpenSearch Dashboards:** provides the data exploration UI.
 
-> **Important:** when explicitly enabled, the agent can execute received commands through a shell. This is powerful remote-administration functionality. Run only on systems you own or are authorized to administer; isolate the lab, protect the admin key, and audit use. Command execution is disabled by default on both the API and agent.
+> **Important:** when explicitly enabled, the agent can execute received commands through a shell. This is powerful remote-administration functionality. Run only on systems you own or are authorized to administer; isolate the lab, protect the admin key, and audit use. Command execution is enabled by default; set `REMOTE_COMMANDS_ENABLED=false` on the API and agent to disable it.
 
 ## Configure and run locally
 
@@ -24,7 +24,7 @@ A prototype, self-hosted security telemetry pipeline. The repository template in
 
 Redis and OpenSearch are not published to the host. The API, dashboard, PostgreSQL, and syslog ports default to loopback. Compose healthchecks gate API startup on Redis/PostgreSQL readiness. The API process itself speaks HTTP; the agent rejects HTTP URLs to non-loopback hosts. Put a trusted TLS reverse proxy in front of the API before connecting remote agents. Configure a trusted OpenSearch CA before setting `OPENSEARCH_VERIFY_CERTS=true`.
 
-To use remote command execution, set `REMOTE_COMMANDS_ENABLED=true` on the API **and** each agent that is allowed to execute commands. Keep it false unless command dispatch is needed and controlled.
+Remote command execution is enabled by default. Set `REMOTE_COMMANDS_ENABLED=false` on both the API and an agent to disable it. Because the feature runs shell commands, allow it only on tightly controlled endpoints and protect the admin key.
 
 ## Tests
 
