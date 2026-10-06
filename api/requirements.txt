@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-redis
-pydantic
-psycopg2-binary
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+redis>=5,<6
+pydantic>=2.8,<3
+psycopg2-binary>=2.9,<3

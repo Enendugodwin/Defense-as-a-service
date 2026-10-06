@@ -1,6 +1,6 @@
 services:
   opensearch:
-    image: opensearchproject/opensearch:latest
+    image: opensearchproject/opensearch:2
     environment:
       cluster.name: cyber-cluster
       node.name: node-1
@@ -11,7 +11,7 @@ services:
     networks: [platform_net]
 
   opensearch-dashboards:
-    image: opensearchproject/opensearch-dashboards:latest
+    image: opensearchproject/opensearch-dashboards:2
     depends_on: [opensearch]
     environment:
       OPENSEARCH_HOSTS: "https://opensearch:9200"
@@ -22,23 +22,39 @@ services:
     networks: [platform_net]
 
   postgres:
-    image: postgres:latest
+    image: postgres:16
     environment:
       POSTGRES_DB: "${POSTGRES_DB:?Set POSTGRES_DB in your local .env}"
       POSTGRES_USER: "${POSTGRES_USER:?Set POSTGRES_USER in your local .env}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env}"
     ports:
       - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     networks: [platform_net]
 
   redis:
-    image: redis:latest
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in your local .env}"
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in your local .env}"]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     networks: [platform_net]
 
   ingest-api:
     build: ./api
-    depends_on: [redis, postgres]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
@@ -49,13 +65,25 @@ services:
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env}"
       REGISTRATION_TOKEN: "${REGISTRATION_TOKEN:?Set REGISTRATION_TOKEN in your local .env}"
       ADMIN_API_KEY: "${ADMIN_API_KEY:?Set ADMIN_API_KEY in your local .env}"
+      REMOTE_COMMANDS_ENABLED: "${REMOTE_COMMANDS_ENABLED:-false}"
+      API_DOCS_ENABLED: "${API_DOCS_ENABLED:-false}"
     ports:
       - "${INGEST_BIND_ADDRESS:-127.0.0.1}:${INGEST_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks: [platform_net]
 
   log-processor:
     build: ./processor
-    depends_on: [redis, opensearch]
+    depends_on:
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_started
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
@@ -68,7 +96,9 @@ services:
 
   syslog-receiver:
     build: ./syslog-receiver
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"

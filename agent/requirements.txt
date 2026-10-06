@@ -1,2 +1,2 @@
-psutil
-requests
+psutil>=6,<8
+requests>=2.32,<3
