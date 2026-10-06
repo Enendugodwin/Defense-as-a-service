@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from datetime import datetime
@@ -38,11 +39,20 @@ class FakeCursor:
             return ("agent-1",)
         if "SELECT last_seen" in self.query and self.params == ("agent-1",):
             return (datetime(2026, 1, 2, 3, 4, 5),)
+        if "SELECT agent_id, status FROM command_sessions" in self.query:
+            return ("agent-1", "active")
+        if "SELECT session_id FROM command_sessions" in self.query:
+            return None
+        if "SELECT session_id, agent_id, status, created_at, last_activity" in self.query:
+            return ("session-1", "agent-1", "active", datetime(2026, 1, 2), datetime(2026, 1, 2))
         if "WHERE agent_id" in self.query and self.params == ("agent-1",):
             return (1,)
         if self.query == "SELECT 1":
             return (1,)
         return None
+
+    def fetchall(self):
+        return []
 
 
 class FakeConnection:
@@ -101,6 +111,21 @@ class ApiSecurityTests(unittest.TestCase):
                 json={"agent_id": "agent-1", "event_type": "test", "data": {}},
             ))
         self.assertEqual(response.status_code, 403)
+
+    def test_agent_package_download_requires_an_agent_token(self):
+        with patch.object(api, "verify_token", return_value=None):
+            response = self.request(lambda client: client.get("/agent-package/main.py"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_agent_package_only_serves_allowlisted_source(self):
+        with patch.object(api, "verify_token", return_value="agent-1"):
+            body, missing = self.request(lambda client: (
+                client.get("/agent-package/session_shell.py"),
+                client.get("/agent-package/../../.env"),
+            ))
+        self.assertEqual(body.status_code, 200)
+        self.assertIn("class PersistentShell", body.text)
+        self.assertEqual(missing.status_code, 404)
 
     def test_agent_status_is_read_only_and_authenticated(self):
         with patch.object(api, "verify_token", return_value="agent-1"):
@@ -182,6 +207,61 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertEqual(len(command_id), 16)
         self.assertEqual(status, 0)
         self.assertEqual(len(output), api.MAX_COMMAND_RESULT_OUTPUT)
+
+    def test_session_open_uses_existing_agent_queue(self):
+        with patch.object(api, "agent_is_enrolled", return_value=True):
+            with patch.object(api, "agent_session_capable", return_value=True):
+                with patch.object(api.r, "lpush") as enqueue:
+                    response = self.request(lambda client: client.post(
+                        "/sessions", headers={"x-api-key": "a" * 64},
+                        json={"agent_id": "agent-1"},
+                    ))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "starting")
+        queued = json.loads(enqueue.call_args.args[1])
+        self.assertEqual(queued["kind"], "session")
+        self.assertEqual(queued["action"], "open")
+        self.assertEqual(queued["session_id"], response.json()["session_id"])
+
+    def test_session_open_requires_an_upgraded_agent(self):
+        with patch.object(api, "agent_is_enrolled", return_value=True):
+            with patch.object(api, "agent_session_capable", return_value=False):
+                with patch.object(api.r, "lpush") as enqueue:
+                    response = self.request(lambda client: client.post(
+                        "/sessions", headers={"x-api-key": "a" * 64},
+                        json={"agent_id": "agent-1"},
+                    ))
+        self.assertEqual(response.status_code, 409)
+        enqueue.assert_not_called()
+
+    def test_session_input_is_queued_as_single_line(self):
+        with patch.object(api.r, "lpush") as enqueue:
+            response = self.request(lambda client: client.post(
+                "/sessions/session-1/input",
+                headers={"x-api-key": "a" * 64},
+                json={"command": "cd C:\\Windows"},
+            ))
+        self.assertEqual(response.status_code, 200)
+        queued = json.loads(enqueue.call_args.args[1])
+        self.assertEqual(queued["action"], "input")
+        self.assertEqual(queued["session_id"], "session-1")
+        self.assertEqual(queued["command"], "cd C:\\Windows")
+
+    def test_session_rejects_multiline_command_input(self):
+        response = self.request(lambda client: client.post(
+            "/sessions/session-1/input",
+            headers={"x-api-key": "a" * 64},
+            json={"command": "one\ntwo"},
+        ))
+        self.assertEqual(response.status_code, 422)
+
+    def test_session_poll_returns_state_and_output_events(self):
+        response = self.request(lambda client: client.get(
+            "/sessions/session-1", headers={"x-api-key": "a" * 64}
+        ))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "active")
+        self.assertEqual(response.json()["events"], [])
 
     def test_command_is_enabled_by_default(self):
         self.assertTrue(api.REMOTE_COMMANDS_ENABLED)

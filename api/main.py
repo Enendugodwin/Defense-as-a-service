@@ -10,6 +10,8 @@ from typing import Any, Dict
 import psycopg2
 import redis
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import FileResponse
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 
@@ -32,7 +34,7 @@ logger = logging.getLogger("defensive_platform.api")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_PASSWORD = required_secret("REDIS_PASSWORD", 16)
+REDIS_PASSWORD = required_secret("REDIS_PASSWORD", max(1, int(os.getenv("REDIS_PASSWORD_MIN_LENGTH", "16"))))
 DB_HOST = os.getenv("DB_HOST", "postgres")
 DB_NAME = os.environ["POSTGRES_DB"]
 DB_USER = os.environ["POSTGRES_USER"]
@@ -42,6 +44,7 @@ ADMIN_API_KEY = required_secret("ADMIN_API_KEY", 32)
 REMOTE_COMMANDS_ENABLED = env_flag("REMOTE_COMMANDS_ENABLED", True)
 API_DOCS_ENABLED = env_flag("API_DOCS_ENABLED", False)
 DB_CONNECT_TIMEOUT = max(1, int(os.getenv("DB_CONNECT_TIMEOUT", "5")))
+SESSION_IDLE_TIMEOUT_SECONDS = max(60, int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "900")))
 MAX_COMMAND_RESULT_OUTPUT = 32768
 
 app = FastAPI(
@@ -87,6 +90,14 @@ class EnrollmentRequest(BaseModel):
     registration_token: str = Field(min_length=1, max_length=512)
 
 
+class SessionStartRequest(BaseModel):
+    agent_id: str = Field(min_length=1, max_length=64)
+
+
+class SessionInputRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=2048)
+
+
 def credentials_match(provided: str, expected: str) -> bool:
     if not provided or not expected:
         return False
@@ -114,6 +125,14 @@ def agent_is_enrolled(agent_id: str) -> bool:
             return cur.fetchone() is not None
 
 
+def agent_session_capable(agent_id: str) -> bool:
+    with closing(get_db_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT session_capable FROM agents WHERE agent_id = %s", (agent_id,))
+            row = cur.fetchone()
+    return bool(row and row[0])
+
+
 @app.on_event("startup")
 def startup_event():
     with closing(get_db_conn()) as conn:
@@ -125,9 +144,13 @@ def startup_event():
                         hostname TEXT NOT NULL,
                         os TEXT NOT NULL,
                         token TEXT UNIQUE NOT NULL,
-                        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        agent_version TEXT,
+                        session_capable BOOLEAN NOT NULL DEFAULT FALSE
                     )"""
                 )
+                cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version TEXT")
+                cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS session_capable BOOLEAN NOT NULL DEFAULT FALSE")
                 cur.execute(
                     """CREATE TABLE IF NOT EXISTS command_results (
                         result_id BIGSERIAL PRIMARY KEY,
@@ -138,10 +161,47 @@ def startup_event():
                         output TEXT NOT NULL DEFAULT ''
                     )"""
                 )
+                cur.execute("ALTER TABLE command_results ADD COLUMN IF NOT EXISTS session_id TEXT")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS command_results_agent_time_idx "
                     "ON command_results (agent_id, received_at DESC, result_id DESC)"
                 )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS command_results_session_idx "
+                    "ON command_results (session_id, result_id)"
+                )
+                cur.execute(
+                    """CREATE TABLE IF NOT EXISTS command_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                        status TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        last_activity TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        closed_at TIMESTAMPTZ
+                    )"""
+                )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS command_sessions_one_active_agent_idx "
+                    "ON command_sessions (agent_id) WHERE status IN ('starting', 'active', 'closing')"
+                )
+
+
+@app.get("/agent-package/{filename}")
+def download_agent_package(filename: str, x_api_key: str = Header(None)):
+    if filename not in {"main.py", "session_shell.py"}:
+        raise HTTPException(status_code=404, detail="Agent package file not found")
+    agent_id = verify_token(x_api_key)
+    if not agent_id:
+        raise HTTPException(status_code=403, detail="Invalid agent API token")
+    package_path = Path(__file__).parent / "agent_release" / filename
+    if not package_path.is_file():
+        raise HTTPException(status_code=404, detail="Agent package file unavailable")
+    return FileResponse(
+        str(package_path),
+        media_type="text/plain; charset=utf-8",
+        filename=filename,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/health")
@@ -213,14 +273,32 @@ def normalize_command_result(data):
 
 def persist_command_result(agent_id: str, data: Dict[str, Any]):
     command_id, status, output = normalize_command_result(data)
+    session_id = data.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        session_id = None
+    session_state = data.get("session_state")
     with closing(get_db_conn()) as conn:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE agent_id = %s", (agent_id,))
+                if session_id:
+                    cur.execute("SELECT agent_id FROM command_sessions WHERE session_id = %s", (session_id,))
+                    session_row = cur.fetchone()
+                    if not session_row or session_row[0] != agent_id:
+                        raise HTTPException(status_code=403, detail="Session does not belong to this agent")
                 cur.execute(
-                    "INSERT INTO command_results (agent_id, command_id, status, output) VALUES (%s, %s, %s, %s)",
-                    (agent_id, command_id, status, output),
+                    "INSERT INTO command_results (agent_id, session_id, command_id, status, output) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (agent_id, session_id, command_id, status, output),
                 )
+                if session_id and session_state in {"active", "closing", "closed", "expired", "error"}:
+                    closed_at = session_state in {"closed", "expired", "error"}
+                    cur.execute(
+                        "UPDATE command_sessions SET status = %s, last_activity = CURRENT_TIMESTAMP, "
+                        "closed_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE closed_at END "
+                        "WHERE session_id = %s AND agent_id = %s",
+                        (session_state, closed_at, session_id, agent_id),
+                    )
     return command_id
 
 
@@ -230,17 +308,27 @@ async def ingest(telemetry: Telemetry, x_api_key: str = Header(None)):
     if not agent_id or not credentials_match(agent_id, telemetry.agent_id):
         raise HTTPException(status_code=403, detail="Invalid or mismatched API token")
 
+    system_info = telemetry.data.get("system", {})
+    capabilities = system_info.get("capabilities", []) if isinstance(system_info, dict) else []
+    agent_version = system_info.get("agent_version") if isinstance(system_info, dict) else None
     try:
-        if telemetry.event_type == "command_result":
+        if telemetry.event_type in {"command_result", "session_event"}:
             command_id = persist_command_result(agent_id, telemetry.data)
             return {"status": "stored", "command_id": command_id}
         with closing(get_db_conn()) as conn:
             with conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE agent_id = %s",
-                        (agent_id,),
-                    )
+                    if "persistent_session_v1" in capabilities:
+                        cur.execute(
+                            "UPDATE agents SET last_seen = CURRENT_TIMESTAMP, agent_version = %s, session_capable = TRUE "
+                            "WHERE agent_id = %s",
+                            (str(agent_version or "unknown")[:64], agent_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE agent_id = %s",
+                            (agent_id,),
+                        )
         r.lpush("telemetry_queue", telemetry.model_dump_json())
     except (psycopg2.Error, redis.RedisError):
         logger.exception("Telemetry ingestion dependency failed")
@@ -305,6 +393,186 @@ def get_command_results(agent_id: str, limit: int):
                 (agent_id, limit),
             )
             return cur.fetchall()
+
+
+@app.get("/admin/agents")
+def admin_agents(x_api_key: str = Header(None)):
+    if not credentials_match(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin API key")
+    try:
+        with closing(get_db_conn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_id, hostname, os, last_seen, agent_version, session_capable "
+                    "FROM agents ORDER BY last_seen DESC"
+                )
+                rows = cur.fetchall()
+    except psycopg2.Error:
+        logger.exception("Agent list lookup failed")
+        raise HTTPException(status_code=503, detail="Agent registry unavailable") from None
+    return {"agents": [
+        {"agent_id": row[0], "hostname": row[1], "os": row[2], "last_seen": row[3].isoformat() if row[3] else None,
+         "agent_version": row[4], "session_capable": bool(row[5])}
+        for row in rows
+    ]}
+
+
+@app.post("/sessions")
+def open_session(request: SessionStartRequest, x_api_key: str = Header(None)):
+    if not credentials_match(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin API key")
+    if not REMOTE_COMMANDS_ENABLED:
+        raise HTTPException(status_code=503, detail="Remote command execution is disabled")
+    if not agent_is_enrolled(request.agent_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if not agent_session_capable(request.agent_id):
+        raise HTTPException(status_code=409, detail="Agent must be upgraded before opening a session")
+    session_id = secrets.token_urlsafe(18)
+    try:
+        with closing(get_db_conn()) as conn:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE command_sessions SET status = 'expired', closed_at = CURRENT_TIMESTAMP "
+                        "WHERE agent_id = %s AND status IN ('starting', 'active', 'closing') "
+                        "AND last_activity < CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')",
+                        (request.agent_id, SESSION_IDLE_TIMEOUT_SECONDS),
+                    )
+                    cur.execute(
+                        "SELECT session_id FROM command_sessions WHERE agent_id = %s "
+                        "AND status IN ('starting', 'active', 'closing') LIMIT 1",
+                        (request.agent_id,),
+                    )
+                    if cur.fetchone():
+                        raise HTTPException(status_code=409, detail="Agent already has an active session")
+                    cur.execute(
+                        "INSERT INTO command_sessions (session_id, agent_id, status) VALUES (%s, %s, 'starting')",
+                        (session_id, request.agent_id),
+                    )
+        r.lpush("commands:" + request.agent_id, json.dumps({
+            "kind": "session", "action": "open", "session_id": session_id
+        }))
+    except HTTPException:
+        raise
+    except psycopg2.Error:
+        logger.exception("Session creation failed")
+        raise HTTPException(status_code=503, detail="Session store unavailable") from None
+    except redis.RedisError:
+        logger.exception("Session open command could not be queued")
+        raise HTTPException(status_code=503, detail="Agent command queue unavailable") from None
+    return {"session_id": session_id, "agent_id": request.agent_id, "status": "starting"}
+
+
+@app.post("/sessions/{session_id}/input")
+def send_session_input(session_id: str, request: SessionInputRequest, x_api_key: str = Header(None)):
+    if not credentials_match(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin API key")
+    if not REMOTE_COMMANDS_ENABLED:
+        raise HTTPException(status_code=503, detail="Remote command execution is disabled")
+    if "\n" in request.command or "\r" in request.command:
+        raise HTTPException(status_code=422, detail="Session input must be a single line")
+    try:
+        with closing(get_db_conn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT agent_id, status FROM command_sessions WHERE session_id = %s", (session_id,))
+                row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        agent_id, status = row
+        if status != "active":
+            raise HTTPException(status_code=409, detail="Session is not active")
+        command_id = secrets.token_hex(12)
+        r.lpush("commands:" + agent_id, json.dumps({
+            "kind": "session", "action": "input", "session_id": session_id,
+            "command_id": command_id, "command": request.command
+        }))
+        with closing(get_db_conn()) as conn:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE command_sessions SET last_activity = CURRENT_TIMESTAMP WHERE session_id = %s",
+                        (session_id,),
+                    )
+    except HTTPException:
+        raise
+    except psycopg2.Error:
+        logger.exception("Session input lookup failed")
+        raise HTTPException(status_code=503, detail="Session store unavailable") from None
+    except redis.RedisError:
+        logger.exception("Session input could not be queued")
+        raise HTTPException(status_code=503, detail="Agent command queue unavailable") from None
+    return {"session_id": session_id, "command_id": command_id, "status": "queued"}
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str, x_api_key: str = Header(None), after_id: int = Query(0, ge=0)):
+    if not credentials_match(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin API key")
+    try:
+        with closing(get_db_conn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id, agent_id, status, created_at, last_activity "
+                    "FROM command_sessions WHERE session_id = %s",
+                    (session_id,),
+                )
+                session = cur.fetchone()
+                if not session:
+                    raise HTTPException(status_code=404, detail="Session not found")
+                cur.execute(
+                    "SELECT result_id, command_id, received_at, status, output FROM command_results "
+                    "WHERE session_id = %s AND result_id > %s ORDER BY result_id ASC LIMIT 100",
+                    (session_id, after_id),
+                )
+                rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except psycopg2.Error:
+        logger.exception("Session state lookup failed")
+        raise HTTPException(status_code=503, detail="Session store unavailable") from None
+    return {
+        "session_id": session[0], "agent_id": session[1], "status": session[2],
+        "created_at": session[3].isoformat() if session[3] else None,
+        "last_activity": session[4].isoformat() if session[4] else None,
+        "events": [
+            {"result_id": row[0], "command_id": row[1], "received_at": row[2].isoformat() if row[2] else None,
+             "status": row[3], "output": row[4][:MAX_COMMAND_RESULT_OUTPUT]}
+            for row in rows
+        ],
+    }
+
+
+@app.delete("/sessions/{session_id}")
+def close_session(session_id: str, x_api_key: str = Header(None)):
+    if not credentials_match(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin API key")
+    try:
+        with closing(get_db_conn()) as conn:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT agent_id, status FROM command_sessions WHERE session_id = %s", (session_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        raise HTTPException(status_code=404, detail="Session not found")
+                    agent_id, status = row
+                    if status not in {"closed", "expired", "error"}:
+                        cur.execute(
+                            "UPDATE command_sessions SET status = 'closing', last_activity = CURRENT_TIMESTAMP WHERE session_id = %s",
+                            (session_id,),
+                        )
+        if status not in {"closed", "expired", "error"}:
+            r.lpush("commands:" + agent_id, json.dumps({
+                "kind": "session", "action": "close", "session_id": session_id
+            }))
+    except HTTPException:
+        raise
+    except psycopg2.Error:
+        logger.exception("Session close lookup failed")
+        raise HTTPException(status_code=503, detail="Session store unavailable") from None
+    except redis.RedisError:
+        logger.exception("Session close could not be queued")
+        raise HTTPException(status_code=503, detail="Agent command queue unavailable") from None
+    return {"session_id": session_id, "status": "closing"}
 
 
 @app.get("/command-results/{agent_id}")

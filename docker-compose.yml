@@ -67,6 +67,7 @@ services:
       ADMIN_API_KEY: "${ADMIN_API_KEY:?Set ADMIN_API_KEY in your local .env}"
       REMOTE_COMMANDS_ENABLED: "${REMOTE_COMMANDS_ENABLED:-true}"
       API_DOCS_ENABLED: "${API_DOCS_ENABLED:-false}"
+      SESSION_IDLE_TIMEOUT_SECONDS: "${SESSION_IDLE_TIMEOUT_SECONDS:-900}"
     ports:
       - "${INGEST_BIND_ADDRESS:-127.0.0.1}:${INGEST_PORT:-8000}:8000"
     healthcheck:
@@ -106,6 +107,20 @@ services:
       SYSLOG_PORT: "514"
     ports:
       - "${SYSLOG_BIND_ADDRESS:-127.0.0.1}:${SYSLOG_HOST_PORT:-514}:514/udp"
+    networks: [platform_net]
+
+  c2-web:
+    build: ./c2-web
+    depends_on:
+      ingest-api:
+        condition: service_healthy
+    environment:
+      API_URL: http://ingest-api:8000
+      ADMIN_API_KEY: "${ADMIN_API_KEY:?Set ADMIN_API_KEY in your local .env}"
+      C2_WEB_HOST: "0.0.0.0"
+      C2_WEB_PORT: "8081"
+    ports:
+      - "127.0.0.1:${C2_WEB_PORT:-8081}:8081"
     networks: [platform_net]
 
 networks:

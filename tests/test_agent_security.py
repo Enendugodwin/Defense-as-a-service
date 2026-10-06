@@ -35,6 +35,14 @@ class AgentSecurityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             agent.validate_api_url("http://example.com")
 
+    def test_private_http_requires_explicit_lab_override(self):
+        with self.assertRaises(ValueError):
+            agent.validate_api_url("http://192.168.100.247:8000")
+        with patch.object(agent, "ALLOW_INSECURE_HTTP", True):
+            self.assertEqual(agent.validate_api_url("http://192.168.100.247:8000"), "http://192.168.100.247:8000")
+            with self.assertRaises(ValueError):
+                agent.validate_api_url("http://8.8.8.8:8000")
+
     def test_api_url_rejects_embedded_credentials_and_query_strings(self):
         for value in ("https://user:pass@example.com", "https://example.com?token=abc", "ftp://example.com"):
             with self.subTest(value=value):
@@ -100,6 +108,55 @@ class AgentSecurityTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("saved token rejected", output.getvalue())
         enroll.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell protocol is verified on the Linux CI runner")
+    def test_session_protocol_reuses_shell_and_closes_it(self):
+        sessions = {}
+        with patch.object(agent.requests, "post") as post:
+            agent.handle_session_message(
+                {"kind": "session", "action": "open", "session_id": "session-1"},
+                sessions, "agent-1", "t" * 48, "https://monitor.example",
+            )
+            agent.handle_session_message(
+                {"kind": "session", "action": "input", "session_id": "session-1", "command_id": "c1", "command": "cd /tmp"},
+                sessions, "agent-1", "t" * 48, "https://monitor.example",
+            )
+            agent.handle_session_message(
+                {"kind": "session", "action": "input", "session_id": "session-1", "command_id": "c2", "command": "pwd"},
+                sessions, "agent-1", "t" * 48, "https://monitor.example",
+            )
+            agent.handle_session_message(
+                {"kind": "session", "action": "close", "session_id": "session-1"},
+                sessions, "agent-1", "t" * 48, "https://monitor.example",
+            )
+        self.assertNotIn("session-1", sessions)
+        events = [call.kwargs["json"]["data"] for call in post.call_args_list]
+        self.assertTrue(any(item.get("command_id") == "c2" and "/tmp" in item.get("output", "") for item in events))
+        self.assertEqual(events[-1]["session_state"], "closed")
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell session is tested on Windows CI")
+    def test_persistent_powershell_keeps_environment_between_commands(self):
+        shell = agent.PersistentShell(idle_timeout=60, command_timeout=5)
+        try:
+            _, first_status = shell.execute("$env:DEFENSIVE_SESSION_TEST='alive'")
+            output, second_status = shell.execute("Write-Output $env:DEFENSIVE_SESSION_TEST")
+            self.assertEqual(first_status, 0)
+            self.assertEqual(second_status, 0)
+            self.assertIn("alive", output)
+        finally:
+            shell.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell persistence is verified on the Linux CI runner")
+    def test_persistent_shell_keeps_working_directory_between_commands(self):
+        shell = agent.PersistentShell(idle_timeout=60, command_timeout=5)
+        try:
+            _, first_status = shell.execute("cd /tmp")
+            output, second_status = shell.execute("pwd")
+            self.assertEqual(first_status, 0)
+            self.assertEqual(second_status, 0)
+            self.assertIn("/tmp", output)
+        finally:
+            shell.close()
 
     def test_remote_execution_is_enabled_by_default_without_running_a_command(self):
         self.assertTrue(agent.REMOTE_COMMANDS_ENABLED)

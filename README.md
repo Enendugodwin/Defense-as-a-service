@@ -1,48 +1,63 @@
 # Defense-as-a-service — Defensive Monitoring Platform
 
-A prototype, self-hosted security telemetry pipeline. The repository template intentionally contains no live credentials. Configure local secrets through an untracked `.env` file before running it.
+A self-hosted prototype for endpoint telemetry, syslog ingestion, command administration, and log search. It is intended for systems you own or are explicitly authorized to administer.
 
-## Components
+## Current capabilities
 
-- **Endpoint agent:** collects host identity, CPU/memory, and top-process telemetry from Linux or Windows; enrolls with the API and polls for commands only when explicitly enabled.
-- **FastAPI ingest API:** handles enrollment, token-authenticated telemetry, health/readiness checks, and optional authenticated command queueing.
-- **Redis:** buffers telemetry and pending agent commands.
-- **PostgreSQL:** stores enrolled agent metadata and per-agent tokens.
-- **Processor:** drains telemetry from Redis and indexes events in OpenSearch.
-- **Syslog receiver:** accepts UDP syslog and places messages in the telemetry queue.
-- **CLI console:** lists agents, queues commands for an enrolled agent, and retrieves command-result output from the authenticated API.
-- **OpenSearch Dashboards:** provides the data exploration UI.
+- **Windows/Linux endpoint agent:** reports hostname, OS/kernel, CPU/memory, and top processes; enrolls with a per-agent token and sends telemetry.
+- **FastAPI ingest/control API:** registration, token-authenticated ingest and polling, health/readiness checks, agent status, admin command dispatch, command-result retrieval, and session control.
+- **Redis:** one per-agent command queue plus a telemetry queue for log ingestion.
+- **PostgreSQL:** agent registry, session state, and command-result output. Command results are kept separate from the OpenSearch log pipeline.
+- **Processor + OpenSearch:** indexes telemetry and syslog for search and dashboards.
+- **UDP syslog receiver:** accepts device/legacy syslog and sends it through the telemetry pipeline.
+- **CLI and C2 web console:** list agents, queue commands, inspect results, and open a persistent line-oriented shell session to a session-capable agent.
 
-> **Important:** the agent can execute received commands through a shell. This is powerful remote-administration functionality. Run only on systems you own or are authorized to administer; isolate the lab, protect the admin key, and audit use. Command execution is enabled by default; set `REMOTE_COMMANDS_ENABLED=false` on the API and agent to disable it.
+The web console is a separate local service on port `8081`, bound to loopback by default. For remote access, use an SSH tunnel; do not expose it directly to the internet.
 
-## Configure and run locally
+### Session behavior
 
-1. Copy `.env.example` to `.env`.
-2. Set unique values for all blank variables. `REGISTRATION_TOKEN` and `ADMIN_API_KEY` must be at least 32 characters; Redis and PostgreSQL passwords must be at least 16 characters.
-3. Keep host bindings on loopback unless you have configured a TLS reverse proxy and firewall rules.
-4. Start the stack with `docker compose up --build -d`.
+Sessions use the existing per-agent Redis command queue. Windows uses a persistent PowerShell process; Linux uses `/bin/sh`. Working-directory and shell-variable state persist within a session. Sessions are limited to one per agent and expire after 15 minutes idle; individual commands time out after 30 seconds. This is line-oriented, not a full PTY—interactive editors and password prompts are unsupported. Results and session state are stored in PostgreSQL; the GUI does not query OpenSearch for command output.
 
-Redis and OpenSearch are not published to the host. The API, dashboard, PostgreSQL, and syslog ports default to loopback. Compose healthchecks gate API startup on Redis/PostgreSQL readiness. The API process itself speaks HTTP; the agent rejects HTTP URLs to non-loopback hosts. Put a trusted TLS reverse proxy in front of the API before connecting remote agents. Configure a trusted OpenSearch CA before setting `OPENSEARCH_VERIFY_CERTS=true`.
+## Current deployment status
 
-Run `python agent/main.py --doctor` to check API health/readiness and validate the saved agent identity without sending telemetry or polling commands. Normal startup checks the saved token; if the API rejects it with 401/403, the agent attempts one re-enrollment using `REGISTRATION_TOKEN` and securely replaces `agent.token`. The API and agent must both be updated to support the authenticated `/agents/{agent_id}/status` check.
+**Last verified: October 7, 2026, in the private lab.** The API and local web console were healthy, and a Windows agent session completed a harmless `Get-Location` test. The Windows agent was upgraded to session-capable code; the Linux agent remains registered but was not checking in during the last verification.
 
-Remote command execution is enabled by default. Set `REMOTE_COMMANDS_ENABLED=false` on both the API and an agent to disable it. Because the feature runs shell commands, allow it only on tightly controlled endpoints and protect the admin key.
+The Windows lab agent currently uses an explicit `ALLOW_INSECURE_HTTP` override to reach the API. Agent tokens and session traffic are therefore unencrypted on that private network. Do not use this transport on an untrusted network; TLS is a required production follow-up. The Windows agent is running from a Python script rather than an installed/signed service package, so reboot persistence and managed upgrades remain unfinished.
 
-## Retrieving command output
+## Configure and run
 
-The API exposes `GET /command-results/{agent_id}` behind the admin API key. Command-result events are stored in a dedicated PostgreSQL table, separate from the OpenSearch log-ingestion pipeline. The CLI console menu option **3** asks for an agent ID and displays recent result IDs, exit statuses, timestamps, and output; it intentionally omits command text. When queuing a command, the CLI prints its result ID so the output can be correlated. Output may contain sensitive data, so protect API access and configure result retention.
+1. Copy `.env.example` to `.env` and set unique, strong values. Never commit the populated `.env`.
+2. Keep the web-console host binding on loopback.
+3. Start the stack with `docker compose up --build -d`.
+4. Open `http://127.0.0.1:8081` on the server, or tunnel it from your workstation:
 
-## Tests
+   ```bash
+   ssh -L 8081:127.0.0.1:8081 <user>@<server>
+   ```
 
-Install the development dependencies and run the mocked API/agent tests:
+   Then browse to <http://127.0.0.1:8081>.
+
+Run `python agent/main.py --doctor` on an endpoint to check API health/readiness and its saved identity without sending telemetry or polling commands. If a saved token is rejected with 401/403, normal startup attempts one re-enrollment using `REGISTRATION_TOKEN`.
+
+The API requires an admin key for command/session operations. Remote shell command execution is enabled by default in this lab configuration; set `REMOTE_COMMANDS_ENABLED=false` on the API and agent to disable it. Commands execute with the agent process's operating-system privileges. Protect the admin key and restrict access to the session console.
+
+For local mocked tests:
 
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-Tests do not connect to a real database, Redis, endpoint, or OpenSearch cluster.
+## Roadmap
 
-## Current limitations
+See [ROADMAP.md](ROADMAP.md) for completed capabilities, current gaps, and prioritized next steps.
 
-This is a prototype rather than a complete SIEM/EDR product. Agentless SSH/WinRM/SNMP collection, Sigma correlation and alerting, fleet UI, RBAC/MFA, production agent packaging, full operational backups, and retention policies remain future work. Review TLS termination, certificate verification, audit logging, immutable dependency/image pinning, backups, and retention before non-lab use.
+## Project files
+
+- `api/` — FastAPI ingest, enrollment, command, session, and results endpoints.
+- `agent/` — cross-platform telemetry and session-capable endpoint agent.
+- `processor/` — Redis-to-OpenSearch telemetry indexing.
+- `syslog-receiver/` — UDP syslog ingestion.
+- `c2-web/` — loopback-only web console.
+- `c2_console.py` — CLI operator console.
+- `docker-compose.yml` — local deployment template with loopback defaults for the console and data services.
