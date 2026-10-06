@@ -2,6 +2,7 @@ import redis
 import os
 import json
 import time
+from datetime import datetime, timezone
 from opensearchpy import OpenSearch
 
 REDIS_PASS = os.environ["REDIS_PASSWORD"]
@@ -26,6 +27,13 @@ while True:
         if result:
             _, message = result
             data = json.loads(message)
+            if not isinstance(data, dict):
+                raise ValueError("Telemetry event must be a JSON object")
+            data.setdefault("received_at", datetime.now(timezone.utc).isoformat())
+            if data.get("event_type") == "command_result" and isinstance(data.get("data"), dict):
+                output = data["data"].get("output")
+                if isinstance(output, str) and len(output) > 32768:
+                    data["data"]["output"] = output[:32768]
             date_str = time.strftime('%Y.%m.%d')
             index_name = f'telemetry-{date_str}'
             client.index(index=index_name, body=data)

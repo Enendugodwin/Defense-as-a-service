@@ -119,6 +119,70 @@ class ApiSecurityTests(unittest.TestCase):
             ))
         self.assertEqual(response.status_code, 403)
 
+    def test_command_results_require_admin_authentication(self):
+        with patch.object(api, "get_command_results") as get_results:
+            response = self.request(lambda client: client.get(
+                "/command-results/agent-1", headers={"x-api-key": "wrong"}
+            ))
+        self.assertEqual(response.status_code, 403)
+        get_results.assert_not_called()
+
+    def test_command_results_return_output_without_command_text(self):
+        stored = [("hash-123", datetime(2026, 10, 6, 12, 0, 0), 0, "expected output")]
+        with patch.object(api, "agent_is_enrolled", return_value=True):
+            with patch.object(api, "get_command_results", return_value=stored) as get_results:
+                response = self.request(lambda client: client.get(
+                    "/command-results/agent-1?limit=7",
+                    headers={"x-api-key": "a" * 64},
+                ))
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["count"], 1)
+        record = body["results"][0]
+        self.assertEqual(record["output"], "expected output")
+        self.assertEqual(record["status"], 0)
+        self.assertEqual(record["command_id"], "hash-123")
+        self.assertNotIn("command", record)
+        get_results.assert_called_once_with("agent-1", 7)
+
+    def test_command_results_require_registered_agent(self):
+        with patch.object(api, "agent_is_enrolled", return_value=False):
+            with patch.object(api, "get_command_results") as get_results:
+                response = self.request(lambda client: client.get(
+                    "/command-results/unknown",
+                    headers={"x-api-key": "a" * 64},
+                ))
+        self.assertEqual(response.status_code, 404)
+        get_results.assert_not_called()
+
+    def test_command_result_ingest_is_persisted_separately_from_logs(self):
+        with patch.object(api, "verify_token", return_value="agent-1"):
+            with patch.object(api, "persist_command_result", return_value="hash-123") as persist:
+                with patch.object(api.r, "lpush") as enqueue:
+                    response = self.request(lambda client: client.post(
+                        "/ingest",
+                        headers={"x-api-key": "valid-agent-token"},
+                        json={
+                            "agent_id": "agent-1",
+                            "event_type": "command_result",
+                            "data": {"command_id": "hash-123", "output": "out", "status": 0},
+                        },
+                    ))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "stored")
+        persist.assert_called_once()
+        enqueue.assert_not_called()
+
+    def test_result_normalization_caps_output_and_does_not_store_command_text(self):
+        command_id, status, output = api.normalize_command_result({
+            "command": "private command text",
+            "output": "x" * (api.MAX_COMMAND_RESULT_OUTPUT + 1),
+            "status": 0,
+        })
+        self.assertEqual(len(command_id), 16)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(output), api.MAX_COMMAND_RESULT_OUTPUT)
+
     def test_command_is_enabled_by_default(self):
         self.assertTrue(api.REMOTE_COMMANDS_ENABLED)
         with patch.object(api, "agent_is_enrolled", return_value=True):

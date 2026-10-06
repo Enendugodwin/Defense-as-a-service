@@ -10,7 +10,7 @@ A prototype, self-hosted security telemetry pipeline. The repository template in
 - **PostgreSQL:** stores enrolled agent metadata and per-agent tokens.
 - **Processor:** drains telemetry from Redis and indexes events in OpenSearch.
 - **Syslog receiver:** accepts UDP syslog and places messages in the telemetry queue.
-- **CLI console:** lists agents and can queue commands for an enrolled agent.
+- **CLI console:** lists agents, queues commands for an enrolled agent, and retrieves command-result output from the authenticated API.
 - **OpenSearch Dashboards:** provides the data exploration UI.
 
 > **Important:** the agent can execute received commands through a shell. This is powerful remote-administration functionality. Run only on systems you own or are authorized to administer; isolate the lab, protect the admin key, and audit use. Command execution is enabled by default; set `REMOTE_COMMANDS_ENABLED=false` on the API and agent to disable it.
@@ -27,6 +27,10 @@ Redis and OpenSearch are not published to the host. The API, dashboard, PostgreS
 Run `python agent/main.py --doctor` to check API health/readiness and validate the saved agent identity without sending telemetry or polling commands. Normal startup checks the saved token; if the API rejects it with 401/403, the agent attempts one re-enrollment using `REGISTRATION_TOKEN` and securely replaces `agent.token`. The API and agent must both be updated to support the authenticated `/agents/{agent_id}/status` check.
 
 Remote command execution is enabled by default. Set `REMOTE_COMMANDS_ENABLED=false` on both the API and an agent to disable it. Because the feature runs shell commands, allow it only on tightly controlled endpoints and protect the admin key.
+
+## Retrieving command output
+
+The API exposes `GET /command-results/{agent_id}` behind the admin API key. Command-result events are stored in a dedicated PostgreSQL table, separate from the OpenSearch log-ingestion pipeline. The CLI console menu option **3** asks for an agent ID and displays recent result IDs, exit statuses, timestamps, and output; it intentionally omits command text. When queuing a command, the CLI prints its result ID so the output can be correlated. Output may contain sensitive data, so protect API access and configure result retention.
 
 ## Tests
 

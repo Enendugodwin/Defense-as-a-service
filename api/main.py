@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import os
 import secrets
@@ -7,7 +9,7 @@ from typing import Any, Dict
 
 import psycopg2
 import redis
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 
@@ -40,6 +42,7 @@ ADMIN_API_KEY = required_secret("ADMIN_API_KEY", 32)
 REMOTE_COMMANDS_ENABLED = env_flag("REMOTE_COMMANDS_ENABLED", True)
 API_DOCS_ENABLED = env_flag("API_DOCS_ENABLED", False)
 DB_CONNECT_TIMEOUT = max(1, int(os.getenv("DB_CONNECT_TIMEOUT", "5")))
+MAX_COMMAND_RESULT_OUTPUT = 32768
 
 app = FastAPI(
     title="Defensive Platform Ingest API",
@@ -125,6 +128,20 @@ def startup_event():
                         last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )"""
                 )
+                cur.execute(
+                    """CREATE TABLE IF NOT EXISTS command_results (
+                        result_id BIGSERIAL PRIMARY KEY,
+                        agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                        command_id TEXT NOT NULL,
+                        received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        status INTEGER,
+                        output TEXT NOT NULL DEFAULT ''
+                    )"""
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS command_results_agent_time_idx "
+                    "ON command_results (agent_id, received_at DESC, result_id DESC)"
+                )
 
 
 @app.get("/health")
@@ -139,7 +156,8 @@ def ready():
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
-        r.ping()
+        if not r.ping():
+            raise RuntimeError("Redis is not ready")
     except Exception:
         logger.exception("Readiness check failed")
         raise HTTPException(status_code=503, detail="Dependencies unavailable") from None
@@ -168,6 +186,44 @@ async def enroll(req: EnrollmentRequest):
     return {"agent_id": agent_id, "token": token}
 
 
+def normalize_command_result(data):
+    output = data.get("output", "")
+    if not isinstance(output, str):
+        output = json.dumps(output, ensure_ascii=False)
+    output = output[:MAX_COMMAND_RESULT_OUTPUT]
+
+    command_id = data.get("command_id")
+    if not command_id:
+        command_text = data.get("command")
+        command_id = hashlib.sha256(command_text.encode("utf-8")).hexdigest()[:16] if isinstance(command_text, str) else secrets.token_hex(8)
+    command_id = str(command_id)[:128]
+
+    status = data.get("status")
+    if isinstance(status, bool):
+        status = None
+    elif not isinstance(status, int):
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+    if status is not None and not -(2**31) <= status < 2**31:
+        status = None
+    return command_id, status, output
+
+
+def persist_command_result(agent_id: str, data: Dict[str, Any]):
+    command_id, status, output = normalize_command_result(data)
+    with closing(get_db_conn()) as conn:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE agent_id = %s", (agent_id,))
+                cur.execute(
+                    "INSERT INTO command_results (agent_id, command_id, status, output) VALUES (%s, %s, %s, %s)",
+                    (agent_id, command_id, status, output),
+                )
+    return command_id
+
+
 @app.post("/ingest")
 async def ingest(telemetry: Telemetry, x_api_key: str = Header(None)):
     agent_id = verify_token(x_api_key)
@@ -175,12 +231,15 @@ async def ingest(telemetry: Telemetry, x_api_key: str = Header(None)):
         raise HTTPException(status_code=403, detail="Invalid or mismatched API token")
 
     try:
+        if telemetry.event_type == "command_result":
+            command_id = persist_command_result(agent_id, telemetry.data)
+            return {"status": "stored", "command_id": command_id}
         with closing(get_db_conn()) as conn:
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE agents SET last_seen = %s WHERE agent_id = %s",
-                        (datetime.utcnow(), agent_id),
+                        "UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE agent_id = %s",
+                        (agent_id,),
                     )
         r.lpush("telemetry_queue", telemetry.model_dump_json())
     except (psycopg2.Error, redis.RedisError):
@@ -234,6 +293,48 @@ def agent_status(agent_id: str, x_api_key: str = Header(None)):
         "status": "registered",
         "last_seen": last_seen.isoformat() if hasattr(last_seen, "isoformat") else None,
     }
+
+
+def get_command_results(agent_id: str, limit: int):
+    with closing(get_db_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT command_id, received_at, status, output "
+                "FROM command_results WHERE agent_id = %s "
+                "ORDER BY received_at DESC, result_id DESC LIMIT %s",
+                (agent_id, limit),
+            )
+            return cur.fetchall()
+
+
+@app.get("/command-results/{agent_id}")
+def command_results(
+    agent_id: str,
+    x_api_key: str = Header(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    if not credentials_match(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin API key")
+    try:
+        if not agent_is_enrolled(agent_id):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        rows = get_command_results(agent_id, limit)
+    except HTTPException:
+        raise
+    except psycopg2.Error:
+        logger.exception("Command-result lookup failed")
+        raise HTTPException(status_code=503, detail="Command-result store unavailable") from None
+
+    records = []
+    for command_id, received_at, status, output in rows:
+        records.append({
+            "agent_id": agent_id,
+            "command_id": command_id,
+            "received_at": received_at.isoformat() if received_at else None,
+            "status": status,
+            "output": output[:MAX_COMMAND_RESULT_OUTPUT],
+        })
+    return {"agent_id": agent_id, "count": len(records), "results": records}
 
 
 @app.get("/commands/{agent_id}")
