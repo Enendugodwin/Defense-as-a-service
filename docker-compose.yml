@@ -1,0 +1,83 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    environment:
+      cluster.name: cyber-cluster
+      node.name: node-1
+      discovery.type: single-node
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "${OPENSEARCH_PASSWORD:?Set OPENSEARCH_PASSWORD in your local .env}"
+    networks: [platform_net]
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:latest
+    depends_on: [opensearch]
+    environment:
+      OPENSEARCH_HOSTS: "https://opensearch:9200"
+      OPENSEARCH_USERNAME: "${OPENSEARCH_USER:?Set OPENSEARCH_USER in your local .env}"
+      OPENSEARCH_PASSWORD: "${OPENSEARCH_PASSWORD:?Set OPENSEARCH_PASSWORD in your local .env}"
+    ports:
+      - "${DASHBOARDS_BIND_ADDRESS:-127.0.0.1}:${DASHBOARDS_PORT:-5601}:5601"
+    networks: [platform_net]
+
+  postgres:
+    image: postgres:latest
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:?Set POSTGRES_DB in your local .env}"
+      POSTGRES_USER: "${POSTGRES_USER:?Set POSTGRES_USER in your local .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env}"
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    networks: [platform_net]
+
+  redis:
+    image: redis:latest
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in your local .env}"]
+    networks: [platform_net]
+
+  ingest-api:
+    build: ./api
+    depends_on: [redis, postgres]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in your local .env}"
+      DB_HOST: postgres
+      POSTGRES_DB: "${POSTGRES_DB:?Set POSTGRES_DB in your local .env}"
+      POSTGRES_USER: "${POSTGRES_USER:?Set POSTGRES_USER in your local .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env}"
+      REGISTRATION_TOKEN: "${REGISTRATION_TOKEN:?Set REGISTRATION_TOKEN in your local .env}"
+      ADMIN_API_KEY: "${ADMIN_API_KEY:?Set ADMIN_API_KEY in your local .env}"
+    ports:
+      - "${INGEST_BIND_ADDRESS:-127.0.0.1}:${INGEST_PORT:-8000}:8000"
+    networks: [platform_net]
+
+  log-processor:
+    build: ./processor
+    depends_on: [redis, opensearch]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in your local .env}"
+      OPENSEARCH_HOST: opensearch
+      OPENSEARCH_USER: "${OPENSEARCH_USER:?Set OPENSEARCH_USER in your local .env}"
+      OPENSEARCH_PASSWORD: "${OPENSEARCH_PASSWORD:?Set OPENSEARCH_PASSWORD in your local .env}"
+      OPENSEARCH_VERIFY_CERTS: "${OPENSEARCH_VERIFY_CERTS:-false}"
+    networks: [platform_net]
+
+  syslog-receiver:
+    build: ./syslog-receiver
+    depends_on: [redis]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in your local .env}"
+      SYSLOG_PORT: "514"
+    ports:
+      - "${SYSLOG_BIND_ADDRESS:-127.0.0.1}:${SYSLOG_HOST_PORT:-514}:514/udp"
+    networks: [platform_net]
+
+networks:
+  platform_net:
+    driver: bridge

@@ -1,0 +1,22 @@
+# Local credentials and agent identity
+.env
+.env.*
+!.env.example
+agent.token
+*.token
+*.token.json
+*.pem
+*.key
+
+# Python/build/runtime artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.log
+logs/
+
+# Private project notes
+PROJECT_STATE.md
