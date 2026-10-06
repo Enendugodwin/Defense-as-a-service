@@ -209,6 +209,33 @@ async def send_command(cmd: CommandRequest, x_api_key: str = Header(None)):
     return {"status": "command_queued", "agent": cmd.agent_id}
 
 
+def get_agent_last_seen(agent_id: str):
+    try:
+        with closing(get_db_conn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT last_seen FROM agents WHERE agent_id = %s", (agent_id,))
+                row = cur.fetchone()
+    except psycopg2.Error:
+        logger.exception("Agent status lookup failed")
+        raise HTTPException(status_code=503, detail="Agent status unavailable") from None
+    return row[0] if row else None
+
+
+@app.get("/agents/{agent_id}/status")
+def agent_status(agent_id: str, x_api_key: str = Header(None)):
+    verified_id = verify_token(x_api_key)
+    if not verified_id or not credentials_match(verified_id, agent_id):
+        raise HTTPException(status_code=403, detail="Invalid or mismatched API token")
+    last_seen = get_agent_last_seen(agent_id)
+    if last_seen is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {
+        "agent_id": agent_id,
+        "status": "registered",
+        "last_seen": last_seen.isoformat() if hasattr(last_seen, "isoformat") else None,
+    }
+
+
 @app.get("/commands/{agent_id}")
 async def get_command(agent_id: str, x_api_key: str = Header(None)):
     verified_id = verify_token(x_api_key)

@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import ipaddress
 import json
@@ -201,12 +202,84 @@ def enroll(api_url):
     return token_data
 
 
-def main():
+
+def validate_agent_token(api_url, token_data):
+    response = requests.get(
+        f"{api_url}/agents/{token_data['agent_id']}/status",
+        headers={"x-api-key": token_data["token"]},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code in {401, 403}:
+        return False
+    if response.status_code == 404:
+        raise RuntimeError("API does not support agent status checks; update the ingest API")
+    response.raise_for_status()
+    body = response.json()
+    return body.get("agent_id") == token_data["agent_id"] and body.get("status") == "registered"
+
+
+def load_or_enroll(api_url):
+    token_data = load_token_file(TOKEN_FILE)
+    if token_data is None:
+        return enroll(api_url)
+    if validate_agent_token(api_url, token_data):
+        return token_data
+    logger.warning("Saved agent identity was rejected; attempting one re-enrollment")
+    return enroll(api_url)
+
+
+def request_error_summary(error):
+    response = getattr(error, "response", None)
+    if response is not None:
+        return f"{type(error).__name__} (HTTP {response.status_code})"
+    return type(error).__name__
+
+
+def doctor(api_url):
+    healthy = True
+    for endpoint in ("/health", "/ready"):
+        try:
+            response = requests.get(api_url + endpoint, timeout=REQUEST_TIMEOUT)
+            print(f"API {endpoint}: HTTP {response.status_code}")
+            healthy = healthy and response.status_code == 200
+        except requests.RequestException as exc:
+            print(f"API {endpoint}: unreachable ({request_error_summary(exc)})")
+            healthy = False
+
+    token_data = load_token_file(TOKEN_FILE)
+    if token_data is None:
+        print("Agent identity: no valid local token file; normal startup will enroll")
+        return 0 if healthy else 1
+    try:
+        valid = validate_agent_token(api_url, token_data)
+    except (requests.RequestException, RuntimeError) as exc:
+        print(f"Agent identity: check failed ({request_error_summary(exc)})")
+        return 1
+    if valid:
+        print(f"Agent identity: registered ({token_data['agent_id']})")
+        return 0 if healthy else 1
+    print("Agent identity: saved token rejected; normal startup will attempt one re-enrollment")
+    return 1
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Defensive Platform endpoint agent")
+    parser.add_argument("--doctor", action="store_true", help="check API readiness and the saved agent identity without sending telemetry")
+    args = parser.parse_args(argv)
+
     try:
         api_url = validate_api_url(API_URL)
-        token_data = load_token_file(TOKEN_FILE) or enroll(api_url)
+    except ValueError as exc:
+        logger.error("Agent configuration error: %s", exc)
+        return 2
+
+    if args.doctor:
+        return doctor(api_url)
+
+    try:
+        token_data = load_or_enroll(api_url)
     except (ValueError, RuntimeError, requests.RequestException, OSError) as exc:
-        raise SystemExit(f"Agent setup failed: {type(exc).__name__}") from None
+        logger.error("Agent setup failed: %s", request_error_summary(exc))
+        return 1
 
     agent_id = token_data["agent_id"]
     token = token_data["token"]
@@ -222,7 +295,8 @@ def main():
     else:
         logger.info("Telemetry is active; remote command execution is disabled")
         telemetry_thread.join()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

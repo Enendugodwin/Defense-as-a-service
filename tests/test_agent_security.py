@@ -1,12 +1,26 @@
 import json
+import io
 import os
 import stat
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 os.environ.pop("REMOTE_COMMANDS_ENABLED", None)
 from agent import main as agent
+
+
+class StubResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self.payload = payload or {}
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
 
 
 class AgentSecurityTests(unittest.TestCase):
@@ -42,6 +56,50 @@ class AgentSecurityTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as token_file:
                 token_file.write(json.dumps({"agent_id": "agent-1"}))
             self.assertIsNone(agent.load_token_file(path))
+
+    def test_valid_saved_token_passes_read_only_status_check(self):
+        token_data = {"agent_id": "agent-1", "token": "t" * 48}
+        response = StubResponse(200, {"agent_id": "agent-1", "status": "registered"})
+        with patch.object(agent.requests, "get", return_value=response) as get:
+            self.assertTrue(agent.validate_agent_token("https://monitor.example", token_data))
+        self.assertEqual(get.call_args.kwargs["timeout"], agent.REQUEST_TIMEOUT)
+
+    def test_rejected_saved_token_is_detected_without_polling_commands(self):
+        token_data = {"agent_id": "old-agent", "token": "o" * 48}
+        with patch.object(agent.requests, "get", return_value=StubResponse(403)) as get:
+            self.assertFalse(agent.validate_agent_token("https://monitor.example", token_data))
+        self.assertIn("/agents/old-agent/status", get.call_args.args[0])
+
+    def test_valid_saved_identity_does_not_reenroll(self):
+        saved = {"agent_id": "agent-1", "token": "t" * 48}
+        with patch.object(agent, "load_token_file", return_value=saved):
+            with patch.object(agent, "validate_agent_token", return_value=True):
+                with patch.object(agent, "enroll") as enroll:
+                    self.assertEqual(agent.load_or_enroll("https://monitor.example"), saved)
+        enroll.assert_not_called()
+
+    def test_rejected_saved_identity_reenrolls_once(self):
+        saved = {"agent_id": "old-agent", "token": "o" * 48}
+        fresh = {"agent_id": "new-agent", "token": "n" * 48}
+        with patch.object(agent, "load_token_file", return_value=saved):
+            with patch.object(agent, "validate_agent_token", return_value=False):
+                with patch.object(agent, "enroll", return_value=fresh) as enroll:
+                    result = agent.load_or_enroll("https://monitor.example")
+        self.assertEqual(result, fresh)
+        enroll.assert_called_once_with("https://monitor.example")
+
+    def test_doctor_reports_stale_identity_without_enrolling(self):
+        saved = {"agent_id": "old-agent", "token": "o" * 48}
+        output = io.StringIO()
+        with patch.object(agent.requests, "get", return_value=StubResponse(200)):
+            with patch.object(agent, "load_token_file", return_value=saved):
+                with patch.object(agent, "validate_agent_token", return_value=False):
+                    with patch.object(agent, "enroll") as enroll:
+                        with redirect_stdout(output):
+                            result = agent.doctor("https://monitor.example")
+        self.assertEqual(result, 1)
+        self.assertIn("saved token rejected", output.getvalue())
+        enroll.assert_not_called()
 
     def test_remote_execution_is_enabled_by_default_without_running_a_command(self):
         self.assertTrue(agent.REMOTE_COMMANDS_ENABLED)

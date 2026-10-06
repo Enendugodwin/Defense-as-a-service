@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 # Isolated test-only values; nothing here is a live credential.
@@ -35,6 +36,8 @@ class FakeCursor:
     def fetchone(self):
         if "WHERE token" in self.query and self.params == ("valid-agent-token",):
             return ("agent-1",)
+        if "SELECT last_seen" in self.query and self.params == ("agent-1",):
+            return (datetime(2026, 1, 2, 3, 4, 5),)
         if "WHERE agent_id" in self.query and self.params == ("agent-1",):
             return (1,)
         if self.query == "SELECT 1":
@@ -96,6 +99,23 @@ class ApiSecurityTests(unittest.TestCase):
                 "/ingest",
                 headers={"x-api-key": "wrong"},
                 json={"agent_id": "agent-1", "event_type": "test", "data": {}},
+            ))
+        self.assertEqual(response.status_code, 403)
+
+    def test_agent_status_is_read_only_and_authenticated(self):
+        with patch.object(api, "verify_token", return_value="agent-1"):
+            response = self.request(lambda client: client.get(
+                "/agents/agent-1/status", headers={"x-api-key": "valid-agent-token"}
+            ))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["agent_id"], "agent-1")
+        self.assertEqual(response.json()["status"], "registered")
+        self.assertEqual(response.json()["last_seen"], "2026-01-02T03:04:05")
+
+    def test_agent_status_rejects_invalid_token(self):
+        with patch.object(api, "verify_token", return_value=None):
+            response = self.request(lambda client: client.get(
+                "/agents/agent-1/status", headers={"x-api-key": "wrong"}
             ))
         self.assertEqual(response.status_code, 403)
 

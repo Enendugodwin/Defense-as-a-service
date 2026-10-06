@@ -24,6 +24,8 @@ A prototype, self-hosted security telemetry pipeline. The repository template in
 
 Redis and OpenSearch are not published to the host. The API, dashboard, PostgreSQL, and syslog ports default to loopback. Compose healthchecks gate API startup on Redis/PostgreSQL readiness. The API process itself speaks HTTP; the agent rejects HTTP URLs to non-loopback hosts. Put a trusted TLS reverse proxy in front of the API before connecting remote agents. Configure a trusted OpenSearch CA before setting `OPENSEARCH_VERIFY_CERTS=true`.
 
+Run `python agent/main.py --doctor` to check API health/readiness and validate the saved agent identity without sending telemetry or polling commands. Normal startup checks the saved token; if the API rejects it with 401/403, the agent attempts one re-enrollment using `REGISTRATION_TOKEN` and securely replaces `agent.token`. The API and agent must both be updated to support the authenticated `/agents/{agent_id}/status` check.
+
 Remote command execution is enabled by default. Set `REMOTE_COMMANDS_ENABLED=false` on both the API and an agent to disable it. Because the feature runs shell commands, allow it only on tightly controlled endpoints and protect the admin key.
 
 ## Tests
