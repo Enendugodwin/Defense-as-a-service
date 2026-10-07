@@ -48,6 +48,10 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+## Packaging status
+
+A native Linux setup installer, all-in-one OVA, and signed Windows agent installer are planned but have not been produced. The roadmap tracks their setup, first-boot secret generation, lifecycle, and signing requirements. No real credentials should be baked into any installer or appliance image.
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for completed capabilities, current gaps, and prioritized next steps.

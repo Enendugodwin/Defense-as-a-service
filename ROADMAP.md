@@ -21,15 +21,19 @@ Status reflects the code and private lab checks as of **October 7, 2026**. The s
    - Rotate the remaining legacy service credentials and remove credential-bearing notes/source from the live tree.
    - Restrict PostgreSQL, Redis, and OpenSearch host exposure; keep operator access behind the local tunnel/reverse proxy.
    - Add role-based access, command audit controls, and secret-safe retention for command output.
-2. **Agent packaging and lifecycle**
-   - Build signed/reproducible Windows and Linux packages.
-   - Install the Windows agent as a managed service or scheduled task with controlled restart/update behavior.
-   - Test upgrades, rollback, token recovery, and session cleanup after disconnect/reboot.
-3. **Agentless collection**
+2. **Installer and appliance delivery**
+   - Provide a bare-metal Linux setup script for Docker/Compose, configuration validation, systemd startup, upgrade, and uninstall.
+   - Produce an optional all-in-one Linux OVA for VirtualBox/VMware with documented CPU/RAM/disk and network requirements.
+   - Generate unique secrets at first boot; never bake `.env`, API keys, agent tokens, or passwords into an installer or OVA. Default management interfaces to loopback and require documented TLS/firewall configuration before remote access.
+3. **Agent packaging and lifecycle**
+   - Build signed/reproducible Windows agent installer and Linux service package.
+   - Configure API URL and trusted CA during installation; use one-time enrollment without embedding bootstrap/admin secrets.
+   - Add service management, health checks, controlled upgrades/rollback, uninstall, and persistent logs.
+4. **Agentless collection**
    - Add scoped SSH polling for Linux, WinRM for Windows, and SNMP polling for network devices.
-4. **Detection and alerting**
+5. **Detection and alerting**
    - Normalize telemetry, add Sigma-compatible rules and correlation, and provide notification hooks.
-5. **Operator and production operations**
+6. **Operator and production operations**
    - Fleet/alert triage UI, RBAC/MFA, broader integration/load tests, backups/recovery, index retention, and pinned image/dependency versions.
 
 ## Known limitations
